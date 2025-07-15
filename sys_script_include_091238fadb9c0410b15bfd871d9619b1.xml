@@ -1,0 +1,1032 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<unload unload_date="2025-07-07 08:37:24">
+<sys_script_include action="INSERT_OR_UPDATE">
+<access>public</access>
+<active>true</active>
+<api_name>global.asrAssetManagement</api_name>
+<caller_access/>
+<client_callable>false</client_callable>
+<description/>
+<mobile_callable>false</mobile_callable>
+<name>asrAssetManagement</name>
+<sandbox_callable>false</sandbox_callable>
+<script><![CDATA[/*jshint esnext: true */
+var asrAssetManagement = Class.create();
+asrAssetManagement.prototype = Object.extendsObject(asrBaseClass, {
+	
+	//**Mutatielijst status**//
+	CC_STATE_STOCK : "VOORRAAD",
+	CC_STATE_IN_USE: "IN GEBRUIK",
+	CC_STATE_RETIRED: "VERVALLEN",
+	
+	//**Voorraadlijst status**//
+	CC_STATE_BROKER : "OPSLAG BROKER",
+	CC_STATE_DEFECT: "DEFECT",
+	CC_STATE_AVAILABLE1: "NIEUW",
+	CC_STATE_AVAILABLE2: "HERINZETBAAR",
+	
+	/**SNDOC
+	@name initialize
+	@description initialization of the class
+	@private
+	*/
+	initialize: function() {
+		asrBaseClass.prototype.initialize.call(this);
+		
+		this.impHelp = new global.asrImportHelper();
+		this.userUtils = new global.asrUserUtils();
+		this.utilsAsr = new global.asrUtils();
+		this.myCompany = this.utilsAsr.company;
+		
+		this.defaultVendorForImport = 'ab38ec8fdbea230853e2f1c41d96195b'; // Computacenter
+		
+		this.modelTable = "cmdb_hardware_product_model";
+		this.modelCatTable = "cmdb_model_category";
+
+		this.StockroomOnsite = "5c5dccdbdbdeb2487ffc7e400f9619fb";  // Stockroom: On site
+		this.StockroomOffsite = "303d0c97db92f2487ffc7e400f96194b";  // Stockroom: Off site
+		this.costCenterSD = "f5b4c182db08c7409fd7b34ffe961942"; // Cost Center of servicedesk
+		
+		// Dummy users put in Computacenter CSV sometimes for bulk or urgent delivery. Comma-separated string to array.
+		this.dummyUsers = (gs.getProperty('asr.asset.dummy_users', '') || '').toString().toLowerCase().split(",");
+		
+		// Decision Table 'Computacenter Assets to import: Misco Category to our Model Category'
+		this.decisionTableModelCat = "886c6fb8879709582fc3ea030cbb3559";
+		this.decisionTableInputLabel = "Misco Category from Computacenter Excel";
+		
+		// Decision Table 'Computacenter Assets to import: Misco Category to Asset tabel'
+		this.decisionTableAssetCons = "3bf66194872725109199657f8bbb353a";
+		this.decisionTableAssetConsInputLabel = "Misco Category from Computacenter Excel";
+		
+		// Custom fields used to have Orderprocessing check an Asset manually. 
+		// It is checked each time if these fields still exist before using them, so removing doesn't break anything.
+		this.needsAttentionField = 'u_needs_attention';   // Should asset be manually checked by Orderprocessing true/false
+		this.reasonAttentionField = 'u_reason_attention'; // If above is true, what is reason for it needing manual attention 
+		
+		// Laptop categories in array, for which we use our Asset Tag (WS-number). Instead of vendor's Asset Tag (B-number / IMEI / Serial Number)	
+		this.laptopsWithASRAssetTag = ["NOTEBOOK", "LAPTOP"]; // APPLE MACBOOK is also laptop, but we don't use our WS-number as Asset Tag for them
+		
+		// Categories in array, for which we TEMPORARILY create no incident for empty Tag or Serial. To not flood Orderprocessing with incidents.
+		// Namely NOKIA has too many empty Tagnr/Serial now. Empty this array when Voorraadlijst data has been cleaned up.
+		this.noIncidentForWrongTagOrSerial = ["NOKIA"];
+				
+		asrPolyfill; // to be able to use Number.isNaN()
+	},
+	
+	/**SNDOC
+	@name getModelSysIDbyName
+	@description Gets the SysId of the model
+	@param {string} [modelName] - the Name of the model to look for
+	@returns {type} SysId of the model or null if no one is found
+	*/
+	getModelSysIDbyName: function(modelName){
+		return this.utilsAsr.getSysID(this.modelTable, "name", modelName);
+	},
+	
+	/**SNDOC
+	@name getModelSysIDbyModelNumber
+	@description Gets the SysId of the model
+	@param {string} [modelNumber] - the Model Number to look for (was: TPS Model)
+	@returns {type} sysID of the Model or null if no one is found
+	*/
+	getModelSysIDbyModelNumber: function(modelNumber){
+		return this.utilsAsr.getSysID(this.modelTable, "model_number", modelNumber);
+	},
+	
+	/**SNDOC
+	@name getModelRecord
+	@description Gets record of the model
+	@param {string} [modelSysID] - sysID of the Model to look for
+	@returns {glideRecord} Record of the model or null if no one is found
+	*/
+	getModelRecord: function(modelSysID){
+		var productModel = new GlideRecord(this.modelTable);
+		if(productModel.get(modelSysID))
+			return productModel;
+		else
+			return null;
+	},
+	
+	/**SNDOC
+	@name getCostCenterByCode
+	@description Gets the SysId of the cost center
+	@param {string} [costCenterCode] - the cost center to look for
+	@returns {type} SysId of the cost center or null if no one is found
+	*/
+	getCostCenterByCode: function(costCenterCode){
+		return this.utilsAsr.getSysID("cmn_cost_center", "code", costCenterCode);
+	},
+	
+	/**SNDOC
+	@name getModelCategorySysIDbyName
+	@description Gets the SysId of the model category
+	@param {string} [categoryName] - the category to look for (e.g. Computer)
+	@returns {type} SysId of the category or null if no one is found
+	*/
+	getModelCategorySysIDbyName: function(categoryName) {
+		return this.utilsAsr.getSysID(this.modelCatTable, "name", categoryName);
+	},
+	
+	/**SNDOC
+	@name getModelCategoryFromDecisionTable
+	@description Gets our Model Category based on vendor's model category, using Decision Table "Misco Category to our Model Category"
+	@param {string} [vendorCategory] - Vendor's category
+	@returns {glideRecord} gliderecord of our Model Category. Null if not found or decisionTableInputLabel doesn't exist.
+	*/
+	getModelCategoryFromDecisionTable: function(vendorCategory){
+		var decisionTableInputName = this.utilsAsr.getDecisionTableInputName(this.decisionTableModelCat, this.decisionTableInputLabel);
+		if(typeof decisionTableInputName === 'undefined'){
+			this.setError("getModelCategoryFromDecisionTable: Decision Table sys_id "+this.decisionTableModelCat+" or given Input Label "+this.decisionTableInputLabel+" doesn't exist.");
+			return null;
+		}
+		
+		var dt = new sn_dt.DecisionTableAPI();
+		var inputs = {};
+		inputs[decisionTableInputName] = vendorCategory; //e.g. 'NOKIA'
+		
+		var modelCatGr = dt.getDecision(this.decisionTableModelCat, inputs); //e.g. model category record 'Mobile Device'. Or null of not found
+		if(modelCatGr === null || modelCatGr.isValidRecord() === false){
+			this.setError("getModelCategoryFromDecisionTable: No or invalid Model Category record found in Decision Table sys_id "+this.decisionTableModelCat+". Searched for Vendor Category "+vendorCategory+" in Input Label "+this.decisionTableInputLabel+".");
+			return null;
+		}
+		
+		return modelCatGr;
+	},
+	
+	/**SNDOC
+	@name isAsset
+	@description Gets our Model Category based on vendor's model category, using Decision Table "Misco Category to our Model Category"
+	@param {string} [vendorCategory] - Vendor's category
+	@returns {glideRecord} gliderecord of our Model Category. Null if not found or decisionTableInputLabel doesn't exist.
+	*/
+	isAsset: function(vendorCategory){
+		var decisionTableInputName = this.utilsAsr.getDecisionTableInputName(this.decisionTableAssetCons, this.decisionTableAssetConsInputLabel);
+		if(typeof decisionTableInputName === 'undefined'){
+			this.setError("isAsset: Decision Table sys_id "+this.decisionTableAssetCons+" or given Input Label "+this.decisionTableAssetConsInputLabel+" doesn't exist.");
+			return null;
+		}
+		
+		var dt = new sn_dt.DecisionTableAPI();
+		var inputs = {};
+		inputs[decisionTableInputName] = vendorCategory; //e.g. 'NOKIA'
+		
+		var modelCatGr = dt.getDecision(this.decisionTableAssetCons, inputs); //e.g. model category record 'Mobile Device'. Or null of not found
+		if(modelCatGr === null || modelCatGr.isValidRecord() === false){
+			this.setError("isAsset: No or invalid Model Category record found in Decision Table sys_id "+this.decisionTableAssetCons+". Searched for Vendor Category "+vendorCategory+" in Input Label "+this.decisionTableAssetConsInputLabel+".");
+			return null;
+		}
+		
+		var result=modelCatGr.result_elements.u_tabel;
+		return (result.toString()=='alm_asset');
+	},
+	
+	/**SNDOC
+	@name getManufacturerByName
+	@description Gets the SysId of the manufacturer
+	@param {string} [manufacturerName] - the manufacturer to look for
+	@returns {type} SysId of the manufacturer or null if no one is found
+	*/
+	getManufacturerByName: function(manufacturerName) {
+		// Changed from getVendor > getManufacturer. Only used by onBefore in Transform Map 'CMDB Workstations'..
+		// .. where a discovered vendor is imported, but is actually not vendor (seller) but manufacturer like HP/Dell. Exception being VMWare which is both.		
+		if(JSUtil.nil(manufacturerName)) return null;		
+		
+		var manuGr = new GlideRecord("core_company");
+		manuGr.addQuery('name', manufacturerName).addOrCondition('name', " "+manufacturerName).addOrCondition('name', manufacturerName+" ");
+		manuGr.setLimit(1);
+		manuGr.query();
+		
+		if(!manuGr.next()) return null;
+		
+		// Checkmark 'Manufacturer' on existing Company record, if it isn't checked already
+		if(manuGr.getDisplayValue('manufacturer') !== 'true'){
+			manuGr.setDisplayValue('manufacturer', 'true');
+			manuGr.update();
+		}
+		
+		return manuGr.getUniqueValue();
+	},
+	
+	/**SNDOC
+	@name createManufacturer
+	@description Creates a new manufacturer
+	@param {string} [manufacturerName] - name of the manufacturer
+	@returns {string} SysID of the created manufacturer
+	*/
+	createManufacturer: function(manufacturerName) {
+		// Changed from createVendor > createManufacturer. Only used by onBefore in Transform Map 'CMDB Workstations'. 
+		// Where a discovered vendor is imported, but is actually not vendor (seller) but manufacturer like HP/Dell. Exception being VMWare which is both.
+		var grManu = new GlideRecord("core_company");
+		grManu.initialize();
+		grManu.setValue('name', manufacturerName);
+		grManu.setValue('manufacturer', true);
+		var sysID = grManu.insert();
+
+		return sysID;
+	},
+	
+	/**SNDOC
+	@name createHardwareModel
+	@description Creates a new hardware model
+	@param {string} [modelName] - name of the model ('Artikelnr' in Computacenter files)
+	@param {string} [modelCategorySysID] - category of the model
+	@param {string} [manufacturerSysID] - manufacturer of the model (was 'vendor' but actually 'manufacturer' was meant. a.s.r.' for Computacenter imports, CHANGE TO 'HP'/'APPLE' etc. if we can distill that from 'Omschrijving' or so in Computacenter file!)
+	@param {string} [description] - optional: short description of the model ('Omschrijving'  in Computacenter files)
+	@param {string} [modelNumber] - optional: Model Number of the model (was: TPS model) ('Artikelnr' in Computacenter files)
+	@returns {string} SysID of the created model. Or null if not created because of missing parameters or if Model Number already exists on a Model
+	*/
+	createHardwareModel: function(modelName, modelCategorySysID, manufacturerSysID, /*optional*/ description, /*optional*/ modelNumber) {
+		if (description === undefined) description = modelName;
+		if (modelNumber === undefined) modelNumber = "NULL"; // modelNumber is mostly only empty from CMDB Workstations import
+		if(!GlideStringUtil.isEligibleSysID(modelCategorySysID) || !GlideStringUtil.isEligibleSysID(manufacturerSysID)){
+			this.setError("createHardwareModel: No correct sys_id was provided for modelCategorySysID or manufacturerSysID. No Model created.");
+			return null;
+		}
+		if(this.getModelSysIDbyModelNumber(modelNumber) !== null){
+			this.setError("createHardwareModel: a Model already exists by this Model Number: "+modelNumber+". No new Model created.");
+			return null;
+		}
+
+		// Create Model
+		var grModel = new GlideRecord(this.modelTable);
+		grModel.initialize();
+		grModel.setValue('manufacturer', manufacturerSysID);
+		grModel.setValue('name', description); //Changed from modelName to description..
+		// .. From import Voorraadlijst/Mutatielijst, modelName was filled with same same as modelNumber ('Artikelnr'). Sometimes unusable name like "Z2W63EA#ABH"
+		// .. While description ('Omschrijving') contains usable name like "HP ELITEBOOK X360 1030 G2". We cut of the "HP"/"DELL"/etc. part in calling function fillModelCatAndModel
+		// .. if createHardwareModel is called from outside import Voorraadlijst/Mutatielijst, description will be undefined and set to same value as modelName
+		grModel.setValue('cmdb_model_category', modelCategorySysID);
+		grModel.setValue('short_description', description);
+		grModel.setValue('model_number', modelNumber);
+		var sysID = grModel.insert();
+
+		return sysID;
+	},
+
+	/**SNDOC
+	@name fillDefaultNewAsset
+	@description Fills a new asset record with the correct default values
+	@param {record} [target] - target record for the values
+	*/
+	fillDefaultNewAsset: function(target) {
+		//This function only creates new asset from (at the moment) Computacenter file import thus it's always their Vendor. And we know Aquisition Type and Expenditure Type.		
+		target.setValue('vendor', this.defaultVendorForImport);
+		target.setValue('acquisition_method', 'purchase');
+		target.setValue('expenditure_type', 'capex');
+	},
+	
+	/**SNDOC
+	@name fillDefaultValues
+	@description Sets default values on Asset which are always true for Computacenter import Assets (even on update, when other filled values might have been changed manually)
+	@param {record} [target] - target record for the values
+	*/
+	fillDefaultValues: function(target){		
+		//'vendor' might be different than Computacenter, so we only set it at fillDefaultNewAsset(). e.g.: iPhone bought at Bechtle, will land in stock at Computacenter later
+		//'cost center' is only Servicedesk IT when asset is Retired/In Stock, so only set it at fillAssetRetired() and fillAssetInStock()			
+		target.setValue('company', this.myCompany); //a.s.r. There might be different Business Units but company is always the same within a.s.r., so far
+	},
+	
+	/**SNDOC
+	@name fillTagAndSupportGroup
+	@description Sets Asset Tag and Support Group, which is dependant on the asset tag
+	@param {record} [target] - target record for the values
+	@param {string} [tagASR] - the Asset Tag currently on the Asset, if it already exists
+	@param {string} [tagNr] - vendor's Tag (Computacenter 'u_tagnr')
+	@param {string} [WSnumber] - if vendor knows WS/WSPAW number (our Tag for most laptops) and puts it in the import file (Computacenter 'ws_nummer' only in Mutatielijst)
+	@param {string} [vendorCategory] - vendor's Category
+	@param {string} [serialNumber] - Serial Number of the Asset
+	*/
+	fillTagAndSupportGroup: function(target, tagASR, tagNr, WSnumber, vendorCategory, serialNumber){
+		if(JSUtil.nil(tagASR)) tagASR = '';
+		if(JSUtil.nil(tagNr)) tagNr = '';
+		if(JSUtil.nil(WSnumber)) WSnumber = '';
+		if(JSUtil.nil(vendorCategory)) return; //import row is already ignored if we have no vendor Category, or if it's not a Category we import
+		if(JSUtil.nil(serialNumber)) return; //import row is already ignored if we have no vendor Serial Number
+		
+		var assetTag = '';
+		if(this.laptopsWithASRAssetTag.indexOf(vendorCategory) > -1){
+			// For laptops (not Apple Macbooks): we use our own Asset Tag. WS number for normal and WSPAW for standalone laptops.
+			// -- insert: WS number is unknown so set WSTPS. Actual WS/WSPAW number almost always first set by SCCM import 'CMDB Workstations'.
+			// -- update: Computacenter Mutatielijst file has field 'WS_nummer' which contains WS/WSPAW. Voorraadlijst import file doesn't have this field.
+			if(WSnumber === '' && tagASR === '') assetTag = 'WSTPS' + (serialNumber);
+			else assetTag = WSnumber;
+		} else{
+			// For other assets: we use vendor's Asset Tag. Computacenter uses Bxxx, or the IMEI/Serial Number, as Asset Tag.
+			// -- insert: if empty 'u_tagnr', import row has been ignored by this point (plus incident for Orderprocessing).
+			// -- update: if empty 'u_tagnr', import row has been ignored by this point (plus incident for Orderprocessing) ONLY if we don't already have an Asset Tag on the asset.
+			if(tagNr !== '') assetTag = tagNr;
+		}
+		if(assetTag !== '')
+			target.setValue('asset_tag', assetTag);
+		
+		//every Asset created and updated from Computacenter import is supported by Servicedesk IT
+		//except for standalone laptops (asset tag WSPAW), they are supported by ITC_OPS MDT IAM
+		if((target.getValue('support_group') || '') === ''){ //leave support group if it's already set, may be different from the standard below		
+			var supportGroup = '';
+			var groupUtils = new global.asrGroupUtils();
+			if((target.getValue('asset_tag') || '').startsWith('WSPAW'))
+				supportGroup = groupUtils.getGroupSysID('ITC_OPS MDT IAM', true);
+			else
+				supportGroup = groupUtils.getGroupSysID('OPS SERVICEDESK', true);
+
+			if(supportGroup !== null && supportGroup !== '')
+				target.setValue('support_group', supportGroup);
+		}
+	},
+	
+	/**SNDOC
+	@name fillAssetInStock
+	@description Fills the asset with the correct values for a asset with status [In Stock]. Called from both 'Voorraadlijst' and 'Mutatielijst'.
+	@param {record} [target] - the target record for the values
+	@param {string} [vendorUserID] - userid of the user if it is reserved for this user
+	@param {string} [dateMutation] - optional: date of mutation in CSV in any format
+	@param {string} [subStatus] - optional: substatus to set if it should not be the default 'available'. Used for voorraadlijst import.
+	*/
+	fillAssetInStock: function(target, vendorUserID, /*OPTIONAL*/ dateMutation, /*optional*/ subStatus) {
+		if(JSUtil.nil(vendorUserID)) vendorUserID = '';
+		if(JSUtil.nil(subStatus)) subStatus = '';
+		var before = this.impHelp.getFieldsAndValues(target); // to compare values before and after later on
+
+		target.setValue('install_status', 6); //In stock
+		target.setValue('cost_center', this.costCenterSD);
+		target.retired = 'NULL'; // Empty Retired Date in case Computacenter sets Asset to Retired, but only repairs it and puts back to In Stock later
+		target.reserved_for = 'NULL';
+		target.setValue('stockroom', this.StockroomOffsite);
+		this._removeReasonAttention(target); // Remove Needs attention, eg. when 'Retired' (actually 'In Maintenance') back to 'In Stock'		
+		var userObj = this._getUser(vendorUserID);
+		
+		// *** Mutatielijst only ***
+		if (userObj !== null) {
+			// User record found
+			// No test if user is active or has expired u_end_date: might get active and u_end_date might be prolonged
+			
+
+			target.setValue('substatus', 'available');
+// 23-06-21: don't set 'Reserved for' anymore. Uncommented logic below in case we want to use 'Reserved For' again.
+// 			var userSysID = userObj.getID(); //get user record's sys_id as String
+			
+// 			if((target.getValue('assigned_to') || '').toString() == (userSysID.toString())){
+// 				// UserID was Assigned to until now. Doesn't make sense to put same user as Reserved For, set Available
+// 				target.setValue('substatus', 'available');
+// 			} else {
+// 				// UserID is different from current Assigned to, set as Reserved For
+// 				target.setValue('substatus', 'reserved');
+// 				target.setValue('reserved_for', userSysID);
+// 			}
+		} else if (this.dummyUsers.indexOf(vendorUserID.toLowerCase()) > -1 && vendorUserID.toLowerCase() === 'asr'){
+			// Dummy User 'ASR' and 'VOORRAAD': set to In Stock - Available, Stockroom 'Off Site' (whereas 'ASR' and 'IN GEBRUIK' means Stockroom 'On Site')
+			target.setValue('substatus', 'available');
+			target.setValue('stockroom', this.StockroomOffsite); //STRY0102214: changed from On Site (a.s.r.) to Off Site (Computacenter)
+			
+			// Put 'Needs attention' if values changed.			
+			if(this.impHelp.recordValuesChanged(/*after*/ this.impHelp.getFieldsAndValues(target), before)){
+				this._setReasonAttention(target, "In Voorraad Computacenter volgens mutatielijst", dateMutation); //STRY0102214: from "Voorraad Balie" to "Voorraad Computacenter"
+			}
+// 23-06-21: don't set 'Reserved for' anymore. Uncommented logic below in case we want to use 'Reserved For' again.
+// 		} else if (this.dummyUsers.indexOf(vendorUserID.toLowerCase()) > -1){ 
+// 			// Other Dummy UserID like 'LOY'. So no User record, but need to process mutation anyway 
+// 			// Computacenter sometimes puts dummy user for bulk mutations
+// 			target.setValue('substatus', 'reserved');
+		
+		// *** Mutatielijst OR Voorraadlijst ***
+		} else {
+			// - No userID was provided
+			// - Or onBefore script set userID to empty string, because of a laptop swap / hand-in when leaving service / LCM, 
+			//   at which the old laptop should not be set to 'reserved' for the old userID
+			// - Or non-existing userID, in that case we'll also get an incident based on setError in function _getUser()
+			
+			//substatus 'available' by default, or set it to given subStatus if that exists as a choice (like 'defective' for voorraadlijst status DEFECT)
+			target.setValue('substatus', subStatus === '' ? "available" : this.utilsAsr.getChoices('alm_asset', 'substatus', 'en', false, true).indexOf(subStatus) > -1 ? subStatus : "available");
+		}
+	},
+
+	/**SNDOC
+	@name fillAssetInUse
+	@description Fills the asset with the correct values for a asset with status [In Use]. Only called from 'Mutatielijst' import.
+	@param {record} [target] - the target record for the values
+	@param {string} [vendorUserID] - userid of the user which owns the asset
+	@param {string} [dateMutation] - optional: date of mutation in CSV in any format
+	*/
+	fillAssetInUse: function(target, vendorUserID, /*OPTIONAL*/ dateMutation) {
+		if(JSUtil.nil(vendorUserID)) vendorUserID = '';
+		var before = this.impHelp.getFieldsAndValues(target); // to compare values before and after later on
+	
+		target.reserved_for = ''; // Emptied with '' instead of 'NULL', otherwise business rule 'Transition reserved to assigned' will prevent Assigned to from being set
+		target.retired = 'NULL'; // Empty Retired Date in case Computacenter sets Asset to Retired, but only repairs it and puts back to In Use later
+		var userObj = this._getUser(vendorUserID);
+		
+		if (userObj !== null) {
+			// User record found
+			// No test if user is active or has expired u_end_date: might get active and u_end_date might be prolonged
+			target.substatus = 'NULL'; //otherwise value stays 'available' when it was In Stock before (INC0541587)	
+			target.setValue('install_status', 1); //In Use
+			target.setValue('assigned_to', userObj.getID()); //get sys_id
+			target.setValue('location', userObj.getLocation());
+			target.setValue('cost_center', userObj.getRecord().getValue('cost_center'));
+			target.setValue('department', userObj.getDepartmentID());
+			target.setValue('company', userObj.getCompanyID());		
+			
+			// Put 'Needs attention' if values changed. Ie.: if laptop was already retired we shouldn't bother Order processing with "Geleverd volgens mutatielijst"
+			// Happens when Computacenter does a correction at their side. Mutation in CSV is only theirs then. Doesn't mean that values for the Asset changed.
+			if(this.impHelp.recordValuesChanged(/*after*/ this.impHelp.getFieldsAndValues(target), before)){
+				this._setReasonAttention(target, "Geleverd volgens mutatielijst", dateMutation);
+			}
+		} else if (this.dummyUsers.indexOf(vendorUserID.toLowerCase()) > -1 && vendorUserID.toLowerCase() === 'asr'){
+			// Dummy User 'ASR' and 'IN GEBRUIK': set to In Stock - Available, Stockroom 'On Site' (STRY0102214) (whereas 'ASR' and 'VOORRAAD' means Stockroom 'Off Site')
+			target.setValue('install_status', 6); //In Stock
+			target.setValue('substatus', 'available');
+			target.setValue('stockroom', this.StockroomOnsite);
+			target.setValue('cost_center', this.costCenterSD);
+			this._removeReasonAttention(target); // Remove Needs attention, eg. when 'Retired' (actually 'In Maintenance') back to 'In Stock'
+			
+			// Put 'Needs attention' if values changed.			
+// 			if(this.impHelp.recordValuesChanged(/*after*/ this.impHelp.getFieldsAndValues(target), before)){
+// 				this._setReasonAttention(target, "In Voorraad Balie volgens mutatielijst", dateMutation); //04-05-22: uncommented in coordination with Mo
+// 			}
+		} else if (this.dummyUsers.indexOf(vendorUserID.toLowerCase()) > -1){
+			// Other Dummy UserID like 'LOY'. So no User record, but need to process mutation anyway 
+			// Should occur less for laptop swaps, now that onBefore script puts correct userID for swap if Computacenter gives us a Dummy
+			target.substatus = 'NULL';
+			target.setValue('install_status', 1); //In Use
+
+			if(this.impHelp.recordValuesChanged(/*after*/ this.impHelp.getFieldsAndValues(target), before)){
+				this._setReasonAttention(target, "Geleverd volgens mutatielijst DUMMY user", dateMutation);	
+			}
+		} else {
+			// No userID was provided.
+			// Or non-existing userID, in that case we'll also get an incident based on setError in function _getUser()
+			target.setValue('install_status', 6); //In Stock
+			target.setValue('substatus', 'available');
+			target.setValue('stockroom', this.StockroomOnsite);
+			
+			this._removeReasonAttention(target); // Remove Needs attention, eg. when 'Retired' (actually 'In Maintenance') back to 'In Stock'
+		}
+	},
+	
+	/**SNDOC
+	@name fillAssetRetired
+	@description Fills the asset with the correct values for a Disposed asset. Only called from 'Mutatielijst' import.
+	@param {record} [target] - Target-record for the values
+	@param {string} [dateMutation] - optional: date of mutation in CSV in any format
+	@param {string} [subStatus] - optional: substatus to set if it should not be the default 'disposed'. Used for voorraadlijst import.
+	*/
+	fillAssetRetired: function(target, /*OPTIONAL*/ dateMutation, /*optional*/ subStatus) {
+		if(JSUtil.nil(subStatus)) subStatus = '';
+		var before = this.impHelp.getFieldsAndValues(target); // to compare values before and after later on
+		
+		target.setValue('install_status', 7); //Retired
+		target.department = 'NULL';
+		target.setValue('cost_center', this.costCenterSD);
+		//setting 'Retired date' and clearing 'Assigned to' is done by OOTB business rule 'Asset Retirement'
+		
+		//substatus 'disposed' by default, or set it to given subStatus if that exists as a choice (like 'pending_disposal' for voorraadlijst status OPSLAG BROKER)
+		target.setValue('substatus', subStatus === '' ? "disposed" : this.utilsAsr.getChoices('alm_asset', 'substatus', 'en', false, true).indexOf(subStatus) > -1 ? subStatus : "disposed");
+		
+		// Put 'Needs attention' if values changed. Ie.: if a laptop was already retired we shouldn't bother Order processing with "Vervallen gemeld door leverancier"
+		// Happens when Computacenter does a correction at their side. Mutation in CSV is only theirs then. Doesn't mean that values for the Asset changed.
+		if(this.impHelp.recordValuesChanged(/*after*/ this.impHelp.getFieldsAndValues(target), before)){
+			this._setReasonAttention(target, "Vervallen gemeld door leverancier", dateMutation);
+		}		
+	},
+	
+	/**SNDOC
+	@name fillAssetBroker
+	@description Fills the asset with the correct values for (to be) Brokered. Based on voorraadlijst. Mutatielijst will not contain this.
+	@param {record} [target] - Target-record for the values
+	*/
+	fillAssetBroker: function(target){
+		//When voorraadlijst status is 'OPSLAG BROKER', set Asset to 'In Stock - Pending disposal' (first idea was 'Retired - Pending disposal' but no OOTB status sync to Asset)
+		this.fillAssetInStock(target, "", "", "pending_disposal");
+	},
+	
+	/**SNDOC
+	@name fillAssetDefect
+	@description Fills the asset with the correct values for Defect. Based on voorraadlijst. Mutatielijst will not contain this.
+	@param {record} [target] - Target-record for the values
+	*/
+	fillAssetDefect: function(target){
+		//When voorraadlijst status is 'DEFECT', set Asset to 'In Stock - Defective'
+		this.fillAssetInStock(target, "", "", "defective");
+	},
+	
+	/**SNDOC
+	@name fillModelCatAndModel
+	@description Finds and fills Model Category and Model (for new Asset or when Model Number isn't same as vendor's Article Number)
+	@param {record} [target] - Target-record for the values
+	@param {string} [vendorArticleNr] - vendor's Article Number from the data source import set row
+	@param {string} [vendorDescription] - vendor's Description from the data source import set row
+	@param {string} [vendorCategory] - vendor's Category from the data source import set row
+	@param {string} [vendorSubCategory] - vendor's Subcategory from the data source import set row
+	*/
+	fillModelCatAndModel: function(target, vendorArticleNr, vendorDescription, vendorCategory, vendorSubCategory){
+		// set Model Category
+		// we should already know vendorCategory is in the Decision Table from comparing against MISCO_CATEGORIES_TO_IMPORT in the onBefore
+		var modelCatGr = this.getModelCategoryFromDecisionTable(vendorCategory);
+		if(this.error) return; // check if error was set just to be sure. Can be read and followed up on by onBefore using this.getError()
+		target.setValue('model_category', modelCatGr.getUniqueValue()); //modelCatGr can't be null at this point, so getUniqueValue() will work
+		
+		// set Model
+		// if model was already found/created and tested to have relation to Model Category, get the result immediately
+		// MODEL_ALREADY_CHECKED exists as an array, if this function is called from import Voorraadlijst/Mutatielijst		
+		var arrExists = typeof MODEL_ALREADY_CHECKED !== 'undefined';
+		var index;
+		if(arrExists && ((index = MODEL_ALREADY_CHECKED.indexOf(vendorArticleNr)) > -1)){			
+			target.setValue('model', MODEL_ALREADY_CHECKED[index + 1]);
+			return;
+		}
+		
+		var modelSysID = this.getModelSysIDbyModelNumber(vendorArticleNr);
+		// -- existing Model
+		if(modelSysID !== null){			
+			// Relate Model to Model Category if not already
+			var modelGr = this.getModelRecord(modelSysID);
+			var modelCatArr = String(modelGr.getValue('cmdb_model_category') || "").split(",");
+			if(modelCatArr.indexOf(modelCatGr.getUniqueValue()) === -1){
+				modelCatArr.push(modelCatGr.getUniqueValue());
+				modelGr.setValue('cmdb_model_category', modelCatArr.join(","));
+				modelGr.update();
+			}
+			
+			target.setValue('model', modelSysID);
+			if(arrExists) MODEL_ALREADY_CHECKED.push(vendorArticleNr, modelSysID);
+			return;
+		}
+		
+		// -- new Model
+		// Manufacturer in first word of Description (most precise), Subcategory (less), or Category (even less precise, eg. non-Apple device might be under APPLE IPAD)?
+		// Get existing Manufacturer. Don't create new Manufacturer if not found, as as we cannot know if first word is actually a manufacturer.		
+		var manufacturerSysID = this.getManufacturerByName(vendorDescription.split(" ")[0]); //from Description, e.g. "IPHONE SE 2020 64 GB WHITE", "NOKIA 2700 CLASSIC"
+		if(manufacturerSysID !== null)
+			vendorDescription = vendorDescription.split(" ").slice(1).join(" "); //remove manufacturer from descr, prevents double manufctr name in model display name		
+		if(manufacturerSysID === null)
+			manufacturerSysID = this.isAppleDevice(vendorCategory, vendorSubCategory, vendorDescription) ? this.getManufacturerByName('apple') : null; //Apple device
+		if(manufacturerSysID === null)
+			manufacturerSysID = this.getManufacturerByName(vendorSubCategory.split(" ")[0]); //from Subcategory, e.g. "", "APPLE IPHONE SE 2E GENERATIE"
+		if(manufacturerSysID === null)
+			manufacturerSysID = this.getManufacturerByName(vendorCategory.split(" ")[0]); //from Category, e.g. "APPLE IPAD", "SMARTPHONE"
+		if(manufacturerSysID === null) 
+			manufacturerSysID = this.myCompany; // none found, set a.s.r. as Manufacturer. Shows in report "Hardware model bijwerken" to set manufacturer by hand
+		
+		modelSysID = this.createHardwareModel(vendorArticleNr, modelCatGr.getUniqueValue(), manufacturerSysID, vendorDescription, vendorArticleNr);
+		
+		target.setValue('model', modelSysID);
+		if(arrExists) MODEL_ALREADY_CHECKED.push(vendorArticleNr, modelSysID);
+	},	
+	
+	/**SNDOC
+	@name getSerialNumberForFieldMap
+	@description Code for field map scripts for 'Serial Number' for both voorraadlijst and mutatielijst transform maps
+	@param {record} [source] - source: import set row from the field map script (global variables used are set by onStart in Transform Map)
+	@returns {string} serial number
+	*/
+	getSerialNumberForFieldMap: function(source){
+		// We need to cut the "S" of serial number for Apple assets
+		// - for most Apple assets Computacenter starts serial number with "S" as it is on the device box
+		// - we however use the serial number without the "S" at the start, as it is on the device itself
+		// This could make performance slow, so build in safeguards to stop script as soon as possible
+		// Coalesce field map runs before onBefore (?), so we cannot put some of this logic in onBefore script
+
+		//GLOBAL variables are set in onStart, and where checked for undefined
+		try{		
+			var vendorCategory = String(source.getValue(CATEGORY_SOURCE) || "").trim().toUpperCase(); // If no Misco Category, set to ""
+			var vendorSerial = String(source.getValue(SERIAL_NUMBER_SOURCE) || "").trim(); // If no Serienr, set to ""
+			
+			// -- If it is NOT a Misco Category we import --
+			
+			// No further special processing for performance. Import row will be ignored by onBefore anyway.
+			// Return serial number or null if empty, like normal.
+			if(MISCO_CATEGORIES_TO_IMPORT.indexOf(vendorCategory) === -1)
+				return vendorSerial === "" ? null : vendorSerial; // result if null: 'Unable to resolve target record, coalesce values not present: u_serienr'
+			
+			// -- If it IS a Misco Category we import --
+			
+			// Return null for empty/wrong serial number, add custom logging to create incident
+			// Custom log needed for incident. Because OOTB for skipped row, no import_log but only the number of skipped records is logged
+			if(vendorSerial === ""){
+				if(this.noIncidentForWrongTagOrSerial.indexOf(vendorCategory) === -1)
+					this._customLogAndIncident(source, "Empty Serial Number in Category "+(vendorCategory));
+				
+				return null;
+			}
+			// If serial number is like ASR119145 it is bogus, return null and log incident
+			else if(vendorSerial.startsWith('ASR')){
+				if(this.noIncidentForWrongTagOrSerial.indexOf(vendorCategory) === -1)
+					this._customLogAndIncident(source, "Serial Number starts with 'ASR', likely dummy. In Category "+(vendorCategory));
+				
+				return null;
+			}
+			// If serial number contains a special character or space inside the string, return null and log incident
+			else if(/[^\p{L}\p{N}\s]/j.test(vendorSerial)){ //IGNORE 'Parsing error'. The 'j' flag is to use Java regex engine, in this case to use unicode
+				if(this.noIncidentForWrongTagOrSerial.indexOf(vendorCategory) === -1)
+					this._customLogAndIncident(source, "Special character (like ?[<{*) in Serial Number in Category "+(vendorCategory));
+				
+				return null;
+			}
+			
+			var vendorSubCategory = String(source.getValue(SUB_CATEGORY_SOURCE) || "").trim().toUpperCase();
+			var vendorDescription = String(source.getValue(DESCRIPTION_SOURCE) || "").trim().toUpperCase();
+			
+			if(this.isAppleDevice(vendorCategory, vendorSubCategory, vendorDescription))    // for Apple device
+				return vendorSerial.startsWith("S") ? vendorSerial.slice(1) : vendorSerial; // return serial number without "S" at the start
+
+			// If not an Apple asset, just return serial number as is
+			return vendorSerial;
+		}catch(e){
+			return null;
+		}
+	},
+	
+	/**SNDOC
+	@name performSharedOnStartTasks
+	@description onStart transform script code shared by transform maps Mutatielijst and Voorraadlijst. Sets and checks global vars used throughout these imports.
+	@param {record} [log] - OOTB 'map' object from the current import run (exists within Transform Scripts).
+	@returns {boolean / string / nothing} Nothing if all is good, otherwise error = true + error message
+	*/
+	performSharedOnStartTasks: function(map){
+		try{
+			// GLOBAL vars must already be defined in the onStart itself, to be able to use them in the other Transform Map scripts
+			// checks for undefined sadly almost defies the purpose of this performSharedOnStartTasks() function, but alas
+			if(typeof SERIAL_NUMBER_SOURCE === 'undefined' || typeof CATEGORY_SOURCE === 'undefined' || typeof SUB_CATEGORY_SOURCE === 'undefined' || typeof DESCRIPTION_SOURCE === 'undefined' || typeof TAG_SOURCE === 'undefined' || typeof SOURCE_FIELD_NAMES === 'undefined' || typeof DATE_TODAY === 'undefined' || typeof TEST_RUN === 'undefined' || typeof TEST_RUN_MAX_ROWS === 'undefined' || typeof IMPORT_ROW_SOURCE === 'undefined' || typeof IMPORT_TABLE === 'undefined' || typeof TARGET_TABLE === 'undefined' || typeof MODEL_ALREADY_CHECKED === 'undefined' || typeof ATTENTION_FIELDS_EXIST === 'undefined' || typeof MISCO_CATEGORIES_TO_IMPORT === 'undefined' || typeof SERIAL_NUMBER === 'undefined' || typeof REASON_ATTENTION_NOT_IN_STOCK === 'undefined'){
+				this.setError("onStart performSharedOnStartTasks(): GLOBAL vars must already be declared in the onStart itself. We cannot do this in performSharedOnStartTasks() because then they can't be used in the other Transform Map scripts.");
+				return;
+			}
+			
+			IMPORT_TABLE = String(map.source_table);
+			TARGET_TABLE = String(map.target_table);
+			
+			// Name of field for import set row number
+			IMPORT_ROW_SOURCE = this.impHelp.importSetRowField;			
+			
+			TEST_RUN = JSUtil.toBoolean(TEST_RUN);
+			if(TEST_RUN && ['asrdev','asracc','asrnonprodtemp'].indexOf(gs.getProperty('instance_name')) === -1)			
+				TEST_RUN = false; //failsafe for when ran on PRD (never in test-mode on PRD to prevent import from never running after moving from DEV > PRD)
+			
+			TEST_RUN_MAX_ROWS = Number(TEST_RUN_MAX_ROWS || 20);
+			
+			// ATTENTION_FIELDS_EXIST used by onBefore or onComplete to know if we can still get/set u_reason_attention/u_needs_attention
+			ATTENTION_FIELDS_EXIST = JSUtil.toBoolean(this.doFieldsExistInTargetTable(TARGET_TABLE, [this.reasonAttentionField, this.needsAttentionField]));
+			
+			// REASON_ATTENTION_NOT_IN_STOCK used by both imports to set or remove the Needs attention with reason 'not in stock at computacenter'
+			REASON_ATTENTION_NOT_IN_STOCK = 'Niet op voorraad Computacenter volgens voorraadlijst';
+			
+			SERIAL_NUMBER = ''; //used in field map Serial Number and onBefore
+			NEW_APPLE_DEVICES = []; //filled by onBefore, event sent by onComplete for notification to team MDM 'New Apple devices inserted'
+			
+			// Make sure MODEL_ALREADY_CHECKED is an array. Is to be be filled by function fillModelCatAndModel
+			// To speed up process, it gets ands sets models that where already processed	
+			if(JSUtil.typeOf(MODEL_ALREADY_CHECKED) !== 'array')
+				MODEL_ALREADY_CHECKED = [];			
+
+			// Get all possible values for "Misco Category from Computacenter Excel" in Decision table 'Misco Category to our Model Category'
+			// e.g. [NOKIA,SMARTPHONE,APPLE IPAD,NOTEBOOK,LAPTOP]
+			// For performance reasons fetched here in onStart, used by onBefore. So we don't have to call the Decision Table API each time we check if we should import the row.
+			MISCO_CATEGORIES_TO_IMPORT = this.utilsAsr.getDecisionTableConditionValuesForInput(this.decisionTableModelCat, this.decisionTableInputLabel);
+			if(typeof MISCO_CATEGORIES_TO_IMPORT === 'undefined'){
+				this.setError("onStart: Decision Table sys_id "+this.decisionTableModelCat+" doesn't exist, doesn't have Input or no condition values for '"+this.decisionTableInputLabel+"'. Can't set MISCO_CATEGORIES_TO_IMPORT.");
+				return;
+			}
+			// this.laptopsWithASRAssetTag: Categories in array, for which we use our own Asset Tag (WS-number). Instead of vendor's Asset Tag (B-number/IMEI/Serial Number).
+			// Check if each category exists in MISCO_CATEGORIES_TO_IMPORT. If not abort import, script needs update.
+			var categoriesExist = this.laptopsWithASRAssetTag.every(function(category){
+				return MISCO_CATEGORIES_TO_IMPORT.indexOf(category) > -1; 
+			});
+			if(!categoriesExist || this.laptopsWithASRAssetTag.length === 0){ 
+				//if this.laptopsWithASRAssetTag is not an array, empty array or doesn't have categories from MISCO_CATEGORIES_TO_IMPORT
+				this.setError("onStart: One or more categories in array asrAssetManagement.laptopsWithASRAssetTag ('"+(this.laptopsWithASRAssetTag)+"') doesn't exist as valid input for Decision Table sys_id "+this.decisionTableModelCat+". Please update the categories in the array accordingly.");
+				return;
+			}
+			
+			// this.noIncidentForWrongTagOrSerial: Categories in array, for which we TEMPORARILY create no incident for empty Tag or Serial. To not flood Orderprocessing with incidents.
+			// Namely NOKIA has too many empty Tagnr/Serial now. Empty this array when Voorraadlijst data has been cleaned up.
+			// Check if each category exists in MISCO_CATEGORIES_TO_IMPORT. If not abort import, script needs update.
+			var categoriesExist2 = this.noIncidentForWrongTagOrSerial.every(function(category){
+				return MISCO_CATEGORIES_TO_IMPORT.indexOf(category) > -1; 
+			});
+			if(!categoriesExist2 || this.noIncidentForWrongTagOrSerial.length === 0){
+				//if this.noIncidentForWrongTagOrSerial is not an array, empty array or doesn't have categories from MISCO_CATEGORIES_TO_IMPORT
+				this.setError("onStart: One or more categories in array asrAssetManagement.noIncidentForWrongTagOrSerial ('"+(this.noIncidentForWrongTagOrSerial)+"') doesn't exist as valid input for Decision Table sys_id "+this.decisionTableModelCat+". Please update the categories in the array accordingly.");
+				return;
+			}
+
+			// Check if given Source Fields do exist in the import table
+			var fieldNamesArr = JSUtil.typeOf(SOURCE_FIELD_NAMES) === 'array' ? SOURCE_FIELD_NAMES : [];
+			if(!this.doFieldsExistInTargetTable(IMPORT_TABLE, fieldNamesArr)){
+				this.setError("onStart: given field name(s) in SOURCE_FIELD_NAMES don't exist in import table ["+(IMPORT_TABLE)+"]: ('"+(fieldNamesArr)+"').");
+				return;
+			}
+
+			return;
+		} catch(e){
+			this.setError("onStart: unexpected error in performSharedOnStartTasks: "+(e));
+			return;
+		}
+	},
+	
+	/**SNDOC
+	@name doFieldsExistInTargetTable
+	@description Checks if fields exist in table, before getting or setting values in them
+	@param {string} [targetTableName] - target table name
+	@param {array} [fieldNames] - field name(s) to test, in array
+	@returns {boolean} true if table and fields exist
+	*/
+	doFieldsExistInTargetTable: function(targetTableName, fieldNames) {
+		if(targetTableName == undefined || !gs.tableExists(targetTableName) || JSUtil.typeOf(fieldNames) !== 'array')
+			return false;
+		
+		var targetGr = new GlideRecord(targetTableName); 
+		var validFieldNames = fieldNames.every(function(fieldName){
+			return targetGr.isValidField(fieldName);
+		});
+		
+		return validFieldNames;
+	},
+	
+	/**SNDOC
+	@name isAppleDevice
+	@description Checks if the asset in the Computacenter import file is most probably an Apple device
+	@param {string} [vendorCategory] - Vendor's category
+	@param {string} [vendorSubCategory] - Vendor's sub category
+	@param {string} [vendorDescription] - Vendor's description
+	@returns {boolean} true if it seems to be an Apple device, false if not
+	*/
+	isAppleDevice: function(vendorCategory, vendorSubCategory, vendorDescription){
+			var apple = 'APPLE '; //with space at end, so we don't trigger on some other product with a name like 'appledrive' or so
+		
+			// If 'Apple' is in Misco Category (most times), Category (many times), or only in Omschrijving (sometimes)
+			return vendorCategory.includes(apple) || vendorSubCategory.includes(apple) || vendorDescription.includes(apple);
+	},
+	
+	/**SNDOC
+	@name _doAttentionFieldsExist
+	@description Checks if fields u_needs_attention and u_reason_attention (still) exist for this Asset's table, before getting or setting values in them
+	@param {GlideRecord} [grAsset] - Record/Table of the asset, eg. target
+	@returns {boolean} true if fields exist
+	*/
+	_doAttentionFieldsExist: function(grAsset) {
+		if(typeof ATTENTION_FIELDS_EXIST !== 'undefined')
+			return ATTENTION_FIELDS_EXIST; //global var set in onStart of Transform Map, use this if we already know the answer
+		
+		return this.doFieldsExistInTargetTable(grAsset.getTableName(), [this.reasonAttentionField, this.needsAttentionField]);
+	},
+	
+	/**SNDOC
+	@name _getUser
+	@description gets a reference to the User record. Ignores non-existing Dummy users like 'ASR' that ComputaCenter provides.
+	@param {string} [vendorUserID] - string with user_id from computacenter CSV
+	@returns {object} reference to User record
+	*/
+	_getUser: function(vendorUserID){
+		var userObj = null;
+		
+		if (JSUtil.notNil(vendorUserID) && this.dummyUsers.indexOf(vendorUserID.toLowerCase()) < 0){ // userID is not empty and not a known Dummy user	
+			vendorUserID = vendorUserID.replaceAll('.', ''); // remove dot if needed (eg. when userID in CSV is '.0814')
+			
+			//if Computacenter employee held SHIFT key, he most probably meant to type numbers instead of these characters
+			//assuming QWERTY layout (not AZERTY etc.) since they're in The Netherlands
+			vendorUserID = vendorUserID.replace(/[\!\@\#\$\%\^\&\*\(\))]/g, function(match) {
+				var shiftValues = {
+						'!': '1',
+						'@': '2',
+						'#': '3',
+						'$': '4',
+						'%': '5',
+						'^': '6',
+						'&': '7',
+						'*': '8',
+						'(': '9',
+						')': '0'
+				};
+				return shiftValues[match];
+			});
+			
+			var leadingZero = '';
+			do {
+				userObj = this.userUtils.getUserByIdOOB(leadingZero.concat(vendorUserID)); // userObj is object with reference to user record and some values of it				
+				leadingZero += '0';
+			}
+			while (userObj === null && !Number.isNaN(vendorUserID) && leadingZero !== '000');	
+			// computacenter CSV misses leading zero's in userID's. Eg. userID in CSV is '804': not found because it's actually '0804'
+			// so if user isn't found, and userID is a number, try to add at most three leading zero's until user found. Up to '0009' then stop if still not found
+	
+			if(userObj === null){				
+				this.setError("No User found for UserID: " + (vendorUserID) + ", cannot set correctly to In Use/In Stock reserved."); 
+				// something went wrong in fetching User (besides the excluded Dummy users or when user is empty), wrong UserID supplied or script bug.
+			}
+		}
+		
+		return userObj; //if this is null and no error was set, it simply means no UserID was provided
+	},
+	
+	/**SNDOC
+	@name _setReasonAttention
+	@description Sets the reason for attention for this record
+	@param {GlideRecord} [grAsset] - Record of the asset
+	@param {string} [reason] - reason the record needs attention
+	@param {string} [dateMutation] - optional: date of mutation in CSV in "dd-MM-yyyy" format. We use today if no (correct) input was provided.
+	*/
+	_setReasonAttention: function(grAsset, reason, /*OPTIONAL*/ dateMutation) {
+		if(!this._doAttentionFieldsExist(grAsset))
+			return;
+			
+		grAsset.setValue(this.needsAttentionField, true);
+		var reasonMsg = reason !== "" ? " " + reason : ""; // If reason isn't empty, precede reason with a space
+		grAsset.setValue(this.reasonAttentionField, this._getLocalDateDutchFormat(dateMutation).concat(reasonMsg));
+	},
+	
+	/**SNDOC
+	@name _removeReasonAttention
+	@description Removes the reason for attention for this record. 
+	             Example: 'In Maintenance' is passed as 'Retired'. But put back to 'In Stock' days later. Should be removed from Needs attention list.
+	@param {GlideRecord} [grAsset] - Record of the asset that doesn't need attention anymore
+	*/
+	_removeReasonAttention: function(grAsset) {
+		if(!this._doAttentionFieldsExist(grAsset))
+			return;
+
+		grAsset.setValue(this.needsAttentionField, false);
+		grAsset[this.reasonAttentionField] = 'NULL';
+	},	
+	
+	/**SNDOC
+	@name _getLocalDateDutchFormat
+	@description Gets the local date in the local Dutch format
+	@param {string} [date] - optional: date in any format
+	@returns {String} Local user's date in local format "dd-MM-yyyy", set to given date or today if no (correct) input was provided
+	*/
+	_getLocalDateDutchFormat:  function(/*OPTIONAL*/ date) {
+		var grDT = this._getGDTobject(date);
+		grDT = grDT.getLocalDate();
+		return grDT.getByFormat("dd-MM-yyyy");
+	},
+	
+	/**SNDOC
+	@name _getLocalDate
+	@description Gets the local date in the standard format
+	@param {string} [date] - optional: date in any format
+	@returns {String} local date in standard format "yyyy-MM-dd", set to given date or today if no (correct) input was provided
+	*/
+	_getLocalDate:  function(/*OPTIONAL*/ date) {
+		var grDT = this._getGDTobject(date);
+		return grDT.getLocalDate();
+	},	
+
+	/**SNDOC
+	@name _getGDTobject
+	@description Gets a GlideDateTime object
+	@param {string} [date] - optional: date in any format
+	@returns {GlideDateTime} GlideDateTime object, set to given date or (if no valid date provided) set to now
+	*/
+	_getGDTobject: function(/*OPTIONAL*/ date) {
+		var result = this.impHelp.getGDTObjectIfValidDate(date);	
+		return result === '' ? this.impHelp.getGDTobject() : result;
+	},
+	
+	/**SNDOC
+	@name importLogAndIgnore
+	@description Logs in Import Log [import_log]. asrLogNotification creates Incident and email import summary when asrImportHelper.triggerEmail is called, based on these logs.
+	@param {Function} [log] - OOTB 'log' object from the current import run (exists within Transform Scripts). Sets Source "ImportSetTransformer(-name transform map-)".
+	@param {number} [importRow] - import row number. Log object already contains it. But asrImportHelper adds it to message as "; Line:xxx", for asrLogNotification to read just in case.
+	
+	@param {string} [message] - optional: log message. Leave empty or set to 'NO' to not log anything.
+	@param {boolean} [ignoreRow] - optional: ignore this import row. Default true.	
+	@param {string} [logLevel] - optional: log level 'info' or 'error'. Default 'error'. If 'error', incident will be created by asrLogNotification.	
+	@param {string} [incDescription] - optional: description to put in Incident. Otherwise only a Short Description will be set by asrLogNotification.
+	
+	@example "ignore = new global.asrAssetManagement.assetImportLogger(log, 12, 'test message', true, 'info', 'test inc description')"
+	*/
+	importLogAndIgnore: function(log, importRow, message, ignoreRow, logLevel, incDescription){
+		if(JSUtil.nil(message)){message = 'NO';}
+		if(JSUtil.nil(ignoreRow)){ignoreRow = true;}
+		if(JSUtil.nil(logLevel)){logLevel = 'error';}
+		
+		if (message !== 'NO') {
+			if(logLevel === 'error'){	
+				log.error(this._logMessageWithIncDescription(message, incDescription, importRow));
+				// Incident will be created in this case via Event import.complete > Notification 'asr Import Complete' > mail script > script include asrLogNotification()
+				// message will be put in Short Description of Incident created from this error
+				// the added '; Description:xxx' to the message string to put 'xxx' in Incident Description
+				// asrImportHelper.buildMessage() adds 'Line:'' to end of message. This won't be put in Incident. Only to notification.
+			} else if(logLevel === 'info'){
+				log.info(this.impHelp.buildMessage(message, importRow));
+				// no Incident will be created in this case. Only a notification.
+			}
+		}
+		
+		return ignoreRow;
+	},
+	
+	/**SNDOC
+	@name _logMessageWithIncDescription
+	@description creates log message meant for 'error' level, which is needed for script include asrLogNotification to create incident + description
+	@param {string} [message] - log message
+	@param {number} [importRow] - import row number. asrImportHelper adds it to message as "; Line:xxx", for asrLogNotification to read just in case.
+	@param {string} [incDescription] - description to put in Incident. Otherwise only a Short Description will be set by asrLogNotification.
+	*/
+	_logMessageWithIncDescription: function(message, incDescription, importRow){
+		return this.impHelp.buildMessage(message.concat("; Description:"+String(incDescription)), importRow);
+	},
+	
+	/**SNDOC
+	@name _customLogAndIncident
+	@description Create import_log and from that (by asrLogNotification) an incident. Only call from: this script include. Call importLogAndIgnore(): from transform map script
+	@param {record} [source] - source: import set row from the field map script (global variables used are set by onStart in Transform Map)
+	@param {string} [incShortDescription] - log message + short description to put in Incident.
+	*/
+	_customLogAndIncident: function(source, incShortDescription){
+		//create custom import_log which will be processed by asrLogNotification as an incident for OPS SERVICENOW (which we assign to OPS ORDERPROCESSING)
+		var importRow = Number(source[IMPORT_ROW_SOURCE]);
+		var importSetSysID = source.getValue('sys_import_set');
+		var incDescription = "Date of import run: "+(this._getLocalDateDutchFormat())+". Excel row: "+this.impHelp.getSourceExcelRow(source)+"";
+		if(this.noIncidentForWrongTagOrSerial.length > 0)
+			incDescription += "\n\n(Temporarily no incident for these Categories with empty/wrong serial/tagnr: "+(this.noIncidentForWrongTagOrSerial)+". Awaiting Computacenter data cleanup.)";
+				
+		var logMessage = this._logMessageWithIncDescription(incShortDescription, incDescription, importRow);
+				
+		// get Import Set Run (source.import_set_run contains the previous run at this point.. so we need to get the current one this way)
+		var importSetRunSysID = null;
+		var importSetRunGr = new GlideRecord('sys_import_set_run');
+		importSetRunGr.addQuery('set', importSetSysID);
+		importSetRunGr.orderByDesc('sys_created_on');
+		importSetRunGr.setLimit(1); //get latest (current) one
+		importSetRunGr.query();
+					
+		if(importSetRunGr.next()){
+			importSetRunSysID = importSetRunGr.getUniqueValue();
+		}
+					
+		// create Import Log
+		var importLog = new GlideRecord('import_log');
+		importLog.initialize();
+		importLog.setValue('import_set', importSetSysID);
+		importLog.setValue('import_set_row', String(source.sys_id)); //not just the number of the row, but a reference to the import set row record
+		importLog.setValue('level', 2); // 'error'. This is needed for asrLogNotification to create incident of it
+		//don't set import_log.source. Not needed for Notification Email Script 'import_complete' or script include asrLogNotification, while it may mess up something else
+		importLog.setValue('run_history', importSetRunSysID);					
+		importLog.setValue('message', logMessage);
+		importLog.insert();	
+	},
+	
+	/**SNDOC
+	@name syncAllFieldsAssetToCI
+	@description Syncs all fields from Asset to its CI (doesn't check if field on Asset was changed or not)
+	@param {glideRecord} [source] - asset GlideRecord
+	*/
+	syncAllFieldsAssetToCI: function (source){
+		// almost same script as function 'syncRecords' in script include 'AssetAndCISynchronizer'
+		// but eg. parameter asyncUpdate set to True (instead of hardcoded false) so that it doesn't check for glideElement.changes(). It simply syncs all fields
+		// also only Asset > CI
+		if(!source.isValidRecord())
+			return;
+		
+		var destinationBaseTable = 'cmdb_ci';
+		
+		var destination = new GlideRecord(destinationBaseTable);
+		var foreignKey = (destinationBaseTable == 'alm_asset') ? 'asset' : 'ci';
+		var destinationId = source[foreignKey].toString();
+		destination = null;
+		if ('cmdb_ci' == destinationBaseTable) {
+			// when synchronizing to a CI, we have to check first for hardware
+			// because
+			// some status fields exist only on hardware table
+			destination = new GlideRecord('cmdb_ci_hardware');
+			// fast forward glide record to proper destination ci,
+			// reset to null if no hardware ci found and proceed with base ci
+			destination.query("sys_id", destinationId);
+			if (!destination.next())
+				destination = null;
+		}
+		if (destination == null) {
+			destination = new GlideRecord(destinationBaseTable);
+			// fast forward glide record to proper destination record
+			// abandon processing if no such record found
+			destination.query("sys_id", destinationId);
+			if (!destination.next())
+				return;
+		}
+		
+		var changes = new global.AssetAndCISynchronizer().syncRecordsWithoutUpdate(source, destination,
+				destinationBaseTable, /*(for state fields) asyncUpdate: destination will be modified even if source hasn't changed*/ true, /*(for non-state fields) checkReconDef: checks if field has changed before sync*/ false);
+		if (changes > 0) {
+			destination.skip_sync = true;
+			destination.update();
+		}
+	},
+
+	type: 'asrAssetManagement'
+});]]></script>
+<sys_class_name>sys_script_include</sys_class_name>
+<sys_created_by>adm_1490</sys_created_by>
+<sys_created_on>2019-10-08 13:56:24</sys_created_on>
+<sys_customer_update>false</sys_customer_update>
+<sys_id>091238fadb9c0410b15bfd871d9619b1</sys_id>
+<sys_mod_count>437</sys_mod_count>
+<sys_name>asrAssetManagement</sys_name>
+<sys_package display_value="Global" source="global">global</sys_package>
+<sys_policy/>
+<sys_replace_on_upgrade>false</sys_replace_on_upgrade>
+<sys_scope display_value="Global">global</sys_scope>
+<sys_update_name>sys_script_include_091238fadb9c0410b15bfd871d9619b1</sys_update_name>
+<sys_updated_by>adm_nna006</sys_updated_by>
+<sys_updated_on>2025-06-26 12:47:42</sys_updated_on>
+</sys_script_include>
+</unload>
