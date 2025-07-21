@@ -644,7 +644,6 @@ asrAssetManagement.prototype = Object.extendsObject(asrBaseClass, {
 	*/
 	performSharedOnStartTasks: function(map){
 		try{
-			gs.info(JSON.stringify(map, null, 2));
 			// GLOBAL vars must already be defined in the onStart itself, to be able to use them in the other Transform Map scripts
 			// checks for undefined sadly almost defies the purpose of this performSharedOnStartTasks() function, but alas
 			if(typeof SERIAL_NUMBER_SOURCE === 'undefined' || typeof CATEGORY_SOURCE === 'undefined' || typeof SUB_CATEGORY_SOURCE === 'undefined' || typeof DESCRIPTION_SOURCE === 'undefined' || typeof TAG_SOURCE === 'undefined' || typeof SOURCE_FIELD_NAMES === 'undefined' || typeof DATE_TODAY === 'undefined' || typeof TEST_RUN === 'undefined' || typeof TEST_RUN_MAX_ROWS === 'undefined' || typeof IMPORT_ROW_SOURCE === 'undefined' || typeof IMPORT_TABLE === 'undefined' || typeof TARGET_TABLE === 'undefined' || typeof MODEL_ALREADY_CHECKED === 'undefined' || typeof ATTENTION_FIELDS_EXIST === 'undefined' || typeof MISCO_CATEGORIES_TO_IMPORT === 'undefined' || typeof SERIAL_NUMBER === 'undefined' || typeof REASON_ATTENTION_NOT_IN_STOCK === 'undefined'){
