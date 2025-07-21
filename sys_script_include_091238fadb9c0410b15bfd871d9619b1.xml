@@ -639,7 +639,7 @@ asrAssetManagement.prototype = Object.extendsObject(asrBaseClass, {
 	/**SNDOC
 	@name performSharedOnStartTasks
 	@description onStart transform script code shared by transform maps Mutatielijst and Voorraadlijst. Sets and checks global vars used throughout these imports.
-	@param {record} [log] - OOTB 'map' object from the current import run (exists within Transform Scripts).
+	@param {object} [map] - OOTB 'map' object from the current import run (exists within Transform Scripts).
 	@returns {boolean / string / nothing} Nothing if all is good, otherwise error = true + error message
 	*/
 	performSharedOnStartTasks: function(map){
